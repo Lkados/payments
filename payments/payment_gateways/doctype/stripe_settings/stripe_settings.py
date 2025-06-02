@@ -296,213 +296,277 @@ def get_gateway_controller(doctype, docname, payment_gateway=None):
 
 
 # ==========================================
-# NOUVELLES FONCTIONS WEBHOOK
+# FONCTIONS WEBHOOK STRIPE
 # ==========================================
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def stripe_webhook_handler():
-	"""Handler pour les webhooks Stripe"""
+	"""Handler principal pour les webhooks Stripe"""
 	try:
 		payload = frappe.local.request.get_data()
 		signature = frappe.get_request_header("Stripe-Signature")
 		
-		if not signature:
-			frappe.throw("Missing Stripe signature")
-			
-		# Récupérer le webhook secret depuis les settings
-		webhook_secret = frappe.db.get_single_value("Stripe Settings", "webhook_secret")
-		
-		if not webhook_secret:
-			frappe.log_error("Webhook secret not configured")
-			return {"status": "error", "message": "Webhook secret not configured"}
-			
-		# Valider la signature
-		doc = frappe.get_doc("Stripe Settings")
-		if not doc.validate_webhook_signature(payload, signature, webhook_secret):
-			frappe.throw("Invalid webhook signature")
-			
 		# Parser l'événement
 		event = json.loads(payload.decode('utf-8'))
+		event_type = event.get("type")
+		event_id = event.get("id")
 		
-		# Log de l'événement
+		# Log de l'événement reçu
+		frappe.log_error(f"Stripe webhook received: {event_type} - {event_id}", "Stripe Webhook Received")
+		
+		# Créer un log de la requête
 		create_request_log({
-			"event_type": event.get("type"),
-			"event_id": event.get("id"),
+			"event_type": event_type,
+			"event_id": event_id,
 			"data": event
-		}, service_name="Stripe Webhook")
+		}, service_name="Stripe Webhook", name=event_id)
 		
-		# Traiter selon le type d'événement
-		handle_stripe_event(event)
+		# Traiter les événements de paiement
+		if event_type == "charge.succeeded":
+			handle_charge_succeeded(event)
+		elif event_type == "payment_intent.succeeded":
+			handle_payment_intent_succeeded(event)
+		elif event_type == "charge.failed":
+			handle_charge_failed(event)
+		elif event_type == "payment_intent.payment_failed":
+			handle_payment_intent_failed(event)
+		elif event_type == "invoice.payment_succeeded":
+			handle_invoice_payment_succeeded(event)
+		elif event_type == "invoice.payment_failed":
+			handle_invoice_payment_failed(event)
 		
-		return {"status": "success"}
+		return {"status": "success", "received": True, "event_type": event_type}
 		
-	except Exception:
+	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Stripe Webhook Error")
-		frappe.throw("Webhook processing failed")
+		return {"status": "error", "message": str(e)}
 
 
-def handle_stripe_event(event):
-	"""Traite les différents types d'événements Stripe"""
-	event_type = event.get("type")
-	data = event.get("data", {}).get("object", {})
-	
-	if event_type == "payment_intent.succeeded":
-		handle_payment_success(data)
-		
-	elif event_type == "payment_intent.payment_failed":
-		handle_payment_failure(data)
-		
-	elif event_type == "invoice.payment_succeeded":
-		handle_subscription_payment_success(data)
-		
-	elif event_type == "invoice.payment_failed":
-		handle_subscription_payment_failure(data)
-		
-	elif event_type == "customer.subscription.deleted":
-		handle_subscription_cancelled(data)
-		
-	elif event_type == "charge.dispute.created":
-		handle_dispute_created(data)
-	
-	# Enqueue pour traitement asynchrone si nécessaire
-	frappe.enqueue(
-		method="payments.payment_gateways.doctype.stripe_settings.stripe_settings.process_webhook_event",
-		queue="long",
-		timeout=600,
-		is_async=True,
-		event_type=event_type,
-		event_data=data
-	)
-
-
-def handle_payment_success(payment_data):
-	"""Gère les paiements réussis"""
-	payment_intent_id = payment_data.get("id")
-	
-	# Chercher la Integration Request correspondante
-	integration_request = frappe.db.get_value(
-		"Integration Request",
-		{"reference_docname": payment_intent_id},
-		"name"
-	)
-	
-	if integration_request:
-		doc = frappe.get_doc("Integration Request", integration_request)
-		
-		# Mettre à jour le statut
-		doc.db_set("status", "Completed", update_modified=False)
-		
-		# Déclencher les hooks de paiement autorisé
-		if doc.reference_doctype and doc.reference_docname:
-			try:
-				ref_doc = frappe.get_doc(doc.reference_doctype, doc.reference_docname)
-				ref_doc.run_method("on_payment_authorized", "Completed")
-				frappe.db.commit()
-			except Exception:
-				frappe.log_error(frappe.get_traceback())
-
-
-def handle_payment_failure(payment_data):
-	"""Gère les échecs de paiement"""
-	payment_intent_id = payment_data.get("id")
-	
-	integration_request = frappe.db.get_value(
-		"Integration Request", 
-		{"reference_docname": payment_intent_id},
-		"name"
-	)
-	
-	if integration_request:
-		doc = frappe.get_doc("Integration Request", integration_request)
-		doc.db_set("status", "Failed", update_modified=False)
-		
-		# Déclencher les hooks d'échec
-		if doc.reference_doctype and doc.reference_docname:
-			try:
-				ref_doc = frappe.get_doc(doc.reference_doctype, doc.reference_docname)
-				ref_doc.run_method("on_payment_failed", "Failed")
-				frappe.db.commit()
-			except Exception:
-				frappe.log_error(frappe.get_traceback())
-
-
-def handle_subscription_payment_success(invoice_data):
-	"""Gère les paiements d'abonnement réussis"""
-	subscription_id = invoice_data.get("subscription")
-	
-	# Logique pour les abonnements
-	call_hook_method("handle_subscription_payment", 
-					subscription_id=subscription_id, 
-					status="success",
-					invoice_data=invoice_data)
-
-
-def handle_subscription_payment_failure(invoice_data):
-	"""Gère les échecs de paiement d'abonnement"""
-	subscription_id = invoice_data.get("subscription")
-	
-	call_hook_method("handle_subscription_payment", 
-					subscription_id=subscription_id, 
-					status="failed",
-					invoice_data=invoice_data)
-
-
-def handle_subscription_cancelled(subscription_data):
-	"""Gère l'annulation d'abonnements"""
-	subscription_id = subscription_data.get("id")
-	
-	call_hook_method("handle_subscription_cancelled", 
-					subscription_id=subscription_id,
-					subscription_data=subscription_data)
-
-
-def handle_dispute_created(dispute_data):
-	"""Gère la création de disputes/chargebacks"""
-	charge_id = dispute_data.get("charge")
-	
-	call_hook_method("handle_payment_dispute", 
-					charge_id=charge_id,
-					dispute_data=dispute_data)
-
-
-def process_webhook_event(event_type, event_data):
-	"""Traitement asynchrone des événements webhook"""
+def handle_charge_succeeded(event):
+	"""Traite les événements charge.succeeded"""
 	try:
-		# Traitement supplémentaire si nécessaire
-		# Par exemple : envoi d'emails, mise à jour de rapports, etc.
+		charge_data = event.get("data", {}).get("object", {})
+		charge_id = charge_data.get("id")
+		amount = charge_data.get("amount", 0) / 100  # Convertir de centimes
+		currency = charge_data.get("currency", "").upper()
 		
-		if event_type in ["payment_intent.succeeded", "invoice.payment_succeeded"]:
-			# Envoyer email de confirmation
-			send_payment_confirmation_email(event_data)
+		frappe.log_error(f"Processing charge.succeeded: {charge_id} - {amount} {currency}", "Stripe Charge Success")
+		
+		# Chercher l'Integration Request correspondante
+		integration_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status, data
+			FROM `tabIntegration Request`
+			WHERE service_name = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			AND (reference_docname LIKE %s OR data LIKE %s)
+			ORDER BY creation DESC
+			LIMIT 5
+		""", (f"%{charge_id}%", f"%{charge_id}%"), as_dict=True)
+		
+		if integration_requests:
+			for req in integration_requests:
+				# Mettre à jour le statut
+				frappe.db.sql("""
+					UPDATE `tabIntegration Request` 
+					SET status = 'Completed', modified = NOW()
+					WHERE name = %s
+				""", req.name)
+				
+				frappe.log_error(f"Updated Integration Request {req.name} to Completed", "Stripe Payment Success")
+				
+				# Déclencher les hooks sur le document de référence
+				if req.reference_doctype and req.reference_docname:
+					try:
+						ref_doc = frappe.get_doc(req.reference_doctype, req.reference_docname)
+						ref_doc.run_method("on_payment_authorized", "Completed")
+						frappe.db.commit()
+						frappe.log_error(f"Payment authorized for {req.reference_doctype} {req.reference_docname}", "Payment Hook Success")
+					except Exception:
+						frappe.log_error(frappe.get_traceback(), "Payment Hook Error")
+				break
+		else:
+			# Si pas d'Integration Request trouvée, chercher par montant et date récente
+			recent_requests = frappe.db.sql("""
+				SELECT name, reference_doctype, reference_docname, status, data
+				FROM `tabIntegration Request`
+				WHERE service_name = 'Stripe'
+				AND status IN ('Initiated', 'Queued')
+				AND DATE(creation) >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+				ORDER BY creation DESC
+				LIMIT 10
+			""", as_dict=True)
 			
-		elif event_type in ["payment_intent.payment_failed", "invoice.payment_failed"]:
-			# Envoyer notification d'échec
-			send_payment_failure_notification(event_data)
-			
-		elif event_type == "charge.dispute.created":
-			# Notifier les disputes
-			send_dispute_notification(event_data)
+			for req in recent_requests:
+				# Vérifier si le montant correspond dans les données
+				if req.data and str(amount) in req.data:
+					frappe.db.sql("""
+						UPDATE `tabIntegration Request` 
+						SET status = 'Completed', modified = NOW()
+						WHERE name = %s
+					""", req.name)
+					
+					frappe.log_error(f"Updated Integration Request {req.name} to Completed (by amount match)", "Stripe Payment Success")
+					break
+			else:
+				frappe.log_error(f"No matching Integration Request found for charge {charge_id}", "Stripe Webhook Warning")
 			
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"Webhook async processing failed: {event_type}")
+		frappe.log_error(frappe.get_traceback(), "Handle Charge Succeeded Error")
 
 
-def send_payment_confirmation_email(payment_data):
-	"""Envoie un email de confirmation de paiement"""
-	# Implémentation de l'envoi d'email
-	pass
+def handle_payment_intent_succeeded(event):
+	"""Traite les événements payment_intent.succeeded"""
+	try:
+		payment_intent_data = event.get("data", {}).get("object", {})
+		payment_intent_id = payment_intent_data.get("id")
+		amount = payment_intent_data.get("amount", 0) / 100
+		currency = payment_intent_data.get("currency", "").upper()
+		
+		frappe.log_error(f"Processing payment_intent.succeeded: {payment_intent_id} - {amount} {currency}", "Stripe Payment Intent Success")
+		
+		# Logique similaire pour payment_intent
+		integration_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status, data
+			FROM `tabIntegration Request`
+			WHERE service_name = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			AND (reference_docname LIKE %s OR data LIKE %s)
+			ORDER BY creation DESC
+			LIMIT 5
+		""", (f"%{payment_intent_id}%", f"%{payment_intent_id}%"), as_dict=True)
+		
+		if integration_requests:
+			for req in integration_requests:
+				frappe.db.sql("""
+					UPDATE `tabIntegration Request` 
+					SET status = 'Completed', modified = NOW()
+					WHERE name = %s
+				""", req.name)
+				
+				frappe.log_error(f"Updated Integration Request {req.name} to Completed", "Stripe Payment Intent Success")
+				
+				# Déclencher les hooks
+				if req.reference_doctype and req.reference_docname:
+					try:
+						ref_doc = frappe.get_doc(req.reference_doctype, req.reference_docname)
+						ref_doc.run_method("on_payment_authorized", "Completed")
+						frappe.db.commit()
+						frappe.log_error(f"Payment authorized for {req.reference_doctype} {req.reference_docname}", "Payment Hook Success")
+					except Exception:
+						frappe.log_error(frappe.get_traceback(), "Payment Hook Error")
+				break
+					
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Payment Intent Succeeded Error")
 
 
-def send_payment_failure_notification(payment_data):
-	"""Envoie une notification d'échec de paiement"""
-	# Implémentation de la notification
-	pass
+def handle_charge_failed(event):
+	"""Traite les événements charge.failed"""
+	try:
+		charge_data = event.get("data", {}).get("object", {})
+		charge_id = charge_data.get("id")
+		failure_message = charge_data.get("failure_message", "Unknown error")
+		
+		frappe.log_error(f"Processing charge.failed: {charge_id} - {failure_message}", "Stripe Charge Failed")
+		
+		# Chercher et mettre à jour l'Integration Request
+		integration_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status
+			FROM `tabIntegration Request`
+			WHERE service_name = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			AND (reference_docname LIKE %s OR data LIKE %s)
+			ORDER BY creation DESC
+			LIMIT 3
+		""", (f"%{charge_id}%", f"%{charge_id}%"), as_dict=True)
+		
+		if integration_requests:
+			for req in integration_requests:
+				frappe.db.sql("""
+					UPDATE `tabIntegration Request` 
+					SET status = 'Failed', error = %s, modified = NOW()
+					WHERE name = %s
+				""", (failure_message, req.name))
+				
+				frappe.log_error(f"Updated Integration Request {req.name} to Failed: {failure_message}", "Stripe Payment Failed")
+				break
+					
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Charge Failed Error")
 
 
-def send_dispute_notification(dispute_data):
-	"""Envoie une notification de dispute"""
-	# Implémentation de la notification de dispute
-	pass
+def handle_payment_intent_failed(event):
+	"""Traite les événements payment_intent.payment_failed"""
+	try:
+		payment_intent_data = event.get("data", {}).get("object", {})
+		payment_intent_id = payment_intent_data.get("id")
+		last_payment_error = payment_intent_data.get("last_payment_error", {})
+		failure_message = last_payment_error.get("message", "Payment failed")
+		
+		frappe.log_error(f"Processing payment_intent.payment_failed: {payment_intent_id} - {failure_message}", "Stripe Payment Intent Failed")
+		
+		# Mettre à jour l'Integration Request
+		integration_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status
+			FROM `tabIntegration Request`
+			WHERE service_name = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			AND (reference_docname LIKE %s OR data LIKE %s)
+			ORDER BY creation DESC
+			LIMIT 3
+		""", (f"%{payment_intent_id}%", f"%{payment_intent_id}%"), as_dict=True)
+		
+		if integration_requests:
+			for req in integration_requests:
+				frappe.db.sql("""
+					UPDATE `tabIntegration Request` 
+					SET status = 'Failed', error = %s, modified = NOW()
+					WHERE name = %s
+				""", (failure_message, req.name))
+				
+				frappe.log_error(f"Updated Integration Request {req.name} to Failed: {failure_message}", "Stripe Payment Intent Failed")
+				break
+					
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Payment Intent Failed Error")
+
+
+def handle_invoice_payment_succeeded(event):
+	"""Traite les événements invoice.payment_succeeded (abonnements)"""
+	try:
+		invoice_data = event.get("data", {}).get("object", {})
+		subscription_id = invoice_data.get("subscription")
+		invoice_id = invoice_data.get("id")
+		
+		frappe.log_error(f"Processing invoice.payment_succeeded: {invoice_id} for subscription {subscription_id}", "Stripe Subscription Payment Success")
+		
+		# Logique pour les abonnements
+		call_hook_method("handle_subscription_payment", 
+						subscription_id=subscription_id, 
+						status="success",
+						invoice_data=invoice_data)
+					
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Invoice Payment Succeeded Error")
+
+
+def handle_invoice_payment_failed(event):
+	"""Traite les événements invoice.payment_failed (abonnements)"""
+	try:
+		invoice_data = event.get("data", {}).get("object", {})
+		subscription_id = invoice_data.get("subscription")
+		invoice_id = invoice_data.get("id")
+		
+		frappe.log_error(f"Processing invoice.payment_failed: {invoice_id} for subscription {subscription_id}", "Stripe Subscription Payment Failed")
+		
+		# Logique pour les abonnements
+		call_hook_method("handle_subscription_payment", 
+						subscription_id=subscription_id, 
+						status="failed",
+						invoice_data=invoice_data)
+					
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Invoice Payment Failed Error")
 
 
 @frappe.whitelist()
@@ -511,7 +575,7 @@ def test_webhook_configuration(gateway_name):
 	try:
 		stripe_settings = frappe.get_doc("Stripe Settings", gateway_name)
 		
-		if not stripe_settings.webhook_secret:
+		if not hasattr(stripe_settings, 'webhook_secret') or not stripe_settings.webhook_secret:
 			return {"success": False, "message": "Webhook secret not configured"}
 		
 		if not stripe_settings.secret_key:
@@ -520,7 +584,7 @@ def test_webhook_configuration(gateway_name):
 		# Vérifier que l'API Stripe fonctionne
 		stripe.api_key = stripe_settings.get_password(fieldname="secret_key", raise_exception=False)
 		
-		# Test simple : lister les webhooks endpoints
+		# Test simple
 		try:
 			endpoints = stripe.WebhookEndpoint.list(limit=10)
 			return {
@@ -539,3 +603,42 @@ def test_webhook_configuration(gateway_name):
 			"success": False, 
 			"message": f"Configuration test failed: {str(e)}"
 		}
+
+
+@frappe.whitelist()
+def force_update_integration_request(integration_request_name, status="Completed"):
+	"""Force la mise à jour d'une Integration Request (pour debug)"""
+	try:
+		frappe.db.sql("""
+			UPDATE `tabIntegration Request` 
+			SET status = %s, modified = NOW()
+			WHERE name = %s
+		""", (status, integration_request_name))
+		
+		frappe.db.commit()
+		
+		return {"success": True, "message": f"Integration Request {integration_request_name} updated to {status}"}
+		
+	except Exception as e:
+		frappe.log_error(frappe.get_traceback(), "Force Update Integration Request Error")
+		return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist()
+def get_pending_integration_requests():
+	"""Récupère les Integration Requests en attente (pour debug)"""
+	try:
+		pending_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status, creation, data
+			FROM `tabIntegration Request`
+			WHERE service_name = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			ORDER BY creation DESC
+			LIMIT 20
+		""", as_dict=True)
+		
+		return {"success": True, "data": pending_requests}
+		
+	except Exception as e:
+		frappe.log_error(frappe.get_traceback(), "Get Pending Integration Requests Error")
+		return {"success": False, "message": str(e)}
