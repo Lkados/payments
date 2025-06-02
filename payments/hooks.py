@@ -179,3 +179,8 @@ override_whitelisted_methods = {
 # Recommended only for DocTypes which have limited documents with untranslated names
 # For example: Role, Gender, etc.
 # translated_search_doctypes = []
+
+# patches/migrations
+app_include_patches = [
+    "payments.patches.add_stripe_webhook_fields"
+]
