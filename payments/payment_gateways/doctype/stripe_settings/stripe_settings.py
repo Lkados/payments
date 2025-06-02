@@ -343,16 +343,46 @@ def stripe_webhook_handler():
 
 
 def handle_charge_succeeded(event):
-	"""Traite les événements charge.succeeded"""
+	"""Traite les événements charge.succeeded - VERSION OPTIMISÉE"""
 	try:
 		charge_data = event.get("data", {}).get("object", {})
 		charge_id = charge_data.get("id")
 		amount = charge_data.get("amount", 0) / 100  # Convertir de centimes
 		currency = charge_data.get("currency", "").upper()
+		description = charge_data.get("description", "")
 		
-		frappe.log_error(f"Processing charge.succeeded: {charge_id} - {amount} {currency}", "Stripe Charge Success")
+		frappe.log_error(f"Processing charge.succeeded: {charge_id} - {amount} {currency} - {description}", "Stripe Charge Success")
 		
-		# Chercher l'Integration Request correspondante
+		# Chercher l'Integration Request correspondante par plusieurs méthodes
+		integration_request = find_integration_request(charge_id, amount, description)
+		
+		if integration_request:
+			# Mettre à jour le statut de l'Integration Request
+			frappe.db.sql("""
+				UPDATE `tabIntegration Request` 
+				SET status = 'Completed', modified = NOW()
+				WHERE name = %s
+			""", integration_request['name'])
+			
+			frappe.log_error(f"Updated Integration Request {integration_request['name']} to Completed", "Stripe Payment Success")
+			
+			# Traiter le Payment Request si c'est le bon type
+			if integration_request['reference_doctype'] == "Payment Request" and integration_request['reference_docname']:
+				process_payment_request(integration_request['reference_docname'], charge_id, amount)
+			
+			frappe.db.commit()
+			frappe.log_error(f"Payment processing completed for {charge_id}", "Stripe Payment Complete")
+		else:
+			frappe.log_error(f"No matching Integration Request found for charge {charge_id}", "Stripe Webhook Warning")
+			
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Handle Charge Succeeded Error")
+
+
+def find_integration_request(charge_id, amount, description):
+	"""Trouve l'Integration Request correspondante par plusieurs méthodes"""
+	try:
+		# Méthode 1: Par charge_id
 		integration_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status, data
 			FROM `tabIntegration Request`
@@ -360,66 +390,50 @@ def handle_charge_succeeded(event):
 			AND status IN ('Initiated', 'Queued')
 			AND (reference_docname LIKE %s OR data LIKE %s)
 			ORDER BY creation DESC
-			LIMIT 5
+			LIMIT 3
 		""", (f"%{charge_id}%", f"%{charge_id}%"), as_dict=True)
 		
 		if integration_requests:
-			for req in integration_requests:
-				# Mettre à jour le statut de l'Integration Request
-				frappe.db.sql("""
-					UPDATE `tabIntegration Request` 
-					SET status = 'Completed', modified = NOW()
-					WHERE name = %s
-				""", req.name)
+			return integration_requests[0]
+		
+		# Méthode 2: Par montant et date récente
+		amount_str = str(amount)
+		integration_requests = frappe.db.sql("""
+			SELECT name, reference_doctype, reference_docname, status, data
+			FROM `tabIntegration Request`
+			WHERE integration_request_service = 'Stripe'
+			AND status IN ('Initiated', 'Queued')
+			AND data LIKE %s
+			AND DATE(creation) >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+			ORDER BY creation DESC
+			LIMIT 3
+		""", f"%{amount_str}%", as_dict=True)
+		
+		if integration_requests:
+			return integration_requests[0]
+		
+		# Méthode 3: Par description (contient souvent le Sales Order)
+		if "SAL-ORD" in description:
+			sales_order = description.split("SAL-ORD-")[1].split()[0]
+			if sales_order:
+				integration_requests = frappe.db.sql("""
+					SELECT name, reference_doctype, reference_docname, status, data
+					FROM `tabIntegration Request`
+					WHERE integration_request_service = 'Stripe'
+					AND status IN ('Initiated', 'Queued', 'Completed')
+					AND data LIKE %s
+					ORDER BY creation DESC
+					LIMIT 1
+				""", f"%SAL-ORD-{sales_order}%", as_dict=True)
 				
-				frappe.log_error(f"Updated Integration Request {req.name} to Completed", "Stripe Payment Success")
-				
-				# Traiter le Payment Request si c'est le bon type
-				if req.reference_doctype == "Payment Request" and req.reference_docname:
-					process_payment_request(req.reference_docname, charge_id, amount)
-				
-				# Déclencher les hooks sur le document de référence
-				if req.reference_doctype and req.reference_docname:
-					try:
-						ref_doc = frappe.get_doc(req.reference_doctype, req.reference_docname)
-						if hasattr(ref_doc, 'run_method'):
-							ref_doc.run_method("on_payment_authorized", "Completed")
-						frappe.db.commit()
-						frappe.log_error(f"Payment authorized for {req.reference_doctype} {req.reference_docname}", "Payment Hook Success")
-					except Exception:
-						frappe.log_error(frappe.get_traceback(), "Payment Hook Error")
-				break
-		else:
-			# Si pas d'Integration Request trouvée, chercher par montant et date récente
-			recent_requests = frappe.db.sql("""
-				SELECT name, reference_doctype, reference_docname, status, data
-				FROM `tabIntegration Request`
-				WHERE integration_request_service = 'Stripe'
-				AND status IN ('Initiated', 'Queued')
-				AND DATE(creation) >= DATE_SUB(NOW(), INTERVAL 1 DAY)
-				ORDER BY creation DESC
-				LIMIT 10
-			""", as_dict=True)
-			
-			for req in recent_requests:
-				# Vérifier si le montant correspond dans les données
-				if req.data and str(amount) in req.data:
-					frappe.db.sql("""
-						UPDATE `tabIntegration Request` 
-						SET status = 'Completed', modified = NOW()
-						WHERE name = %s
-					""", req.name)
-					
-					if req.reference_doctype == "Payment Request" and req.reference_docname:
-						process_payment_request(req.reference_docname, charge_id, amount)
-					
-					frappe.log_error(f"Updated Integration Request {req.name} to Completed (by amount match)", "Stripe Payment Success")
-					break
-			else:
-				frappe.log_error(f"No matching Integration Request found for charge {charge_id}", "Stripe Webhook Warning")
-			
+				if integration_requests:
+					return integration_requests[0]
+		
+		return None
+		
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Handle Charge Succeeded Error")
+		frappe.log_error(frappe.get_traceback(), "Find Integration Request Error")
+		return None
 
 
 def process_payment_request(payment_request_name, stripe_charge_id, amount):
