@@ -356,7 +356,7 @@ def handle_charge_succeeded(event):
 		integration_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status, data
 			FROM `tabIntegration Request`
-			WHERE service_name = 'Stripe'
+			WHERE integration_request_service = 'Stripe'
 			AND status IN ('Initiated', 'Queued')
 			AND (reference_docname LIKE %s OR data LIKE %s)
 			ORDER BY creation DESC
@@ -365,7 +365,7 @@ def handle_charge_succeeded(event):
 		
 		if integration_requests:
 			for req in integration_requests:
-				# Mettre à jour le statut
+				# Mettre à jour le statut de l'Integration Request
 				frappe.db.sql("""
 					UPDATE `tabIntegration Request` 
 					SET status = 'Completed', modified = NOW()
@@ -374,11 +374,16 @@ def handle_charge_succeeded(event):
 				
 				frappe.log_error(f"Updated Integration Request {req.name} to Completed", "Stripe Payment Success")
 				
+				# Traiter le Payment Request si c'est le bon type
+				if req.reference_doctype == "Payment Request" and req.reference_docname:
+					process_payment_request(req.reference_docname, charge_id, amount)
+				
 				# Déclencher les hooks sur le document de référence
 				if req.reference_doctype and req.reference_docname:
 					try:
 						ref_doc = frappe.get_doc(req.reference_doctype, req.reference_docname)
-						ref_doc.run_method("on_payment_authorized", "Completed")
+						if hasattr(ref_doc, 'run_method'):
+							ref_doc.run_method("on_payment_authorized", "Completed")
 						frappe.db.commit()
 						frappe.log_error(f"Payment authorized for {req.reference_doctype} {req.reference_docname}", "Payment Hook Success")
 					except Exception:
@@ -389,7 +394,7 @@ def handle_charge_succeeded(event):
 			recent_requests = frappe.db.sql("""
 				SELECT name, reference_doctype, reference_docname, status, data
 				FROM `tabIntegration Request`
-				WHERE service_name = 'Stripe'
+				WHERE integration_request_service = 'Stripe'
 				AND status IN ('Initiated', 'Queued')
 				AND DATE(creation) >= DATE_SUB(NOW(), INTERVAL 1 DAY)
 				ORDER BY creation DESC
@@ -405,6 +410,9 @@ def handle_charge_succeeded(event):
 						WHERE name = %s
 					""", req.name)
 					
+					if req.reference_doctype == "Payment Request" and req.reference_docname:
+						process_payment_request(req.reference_docname, charge_id, amount)
+					
 					frappe.log_error(f"Updated Integration Request {req.name} to Completed (by amount match)", "Stripe Payment Success")
 					break
 			else:
@@ -412,6 +420,90 @@ def handle_charge_succeeded(event):
 			
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Handle Charge Succeeded Error")
+
+
+def process_payment_request(payment_request_name, stripe_charge_id, amount):
+	"""Traite automatiquement un Payment Request après paiement Stripe réussi"""
+	try:
+		# 1. Mettre à jour le statut du Payment Request directement en DB
+		frappe.db.sql("""
+			UPDATE `tabPayment Request` 
+			SET status = 'Paid', modified = NOW()
+			WHERE name = %s
+		""", payment_request_name)
+		
+		frappe.log_error(f"Payment Request {payment_request_name} updated to Paid", "Payment Request Updated")
+		
+		# 2. Récupérer les infos du Payment Request
+		pr_doc = frappe.get_doc("Payment Request", payment_request_name)
+		
+		# 3. Créer automatiquement un Payment Entry
+		create_automatic_payment_entry(pr_doc, stripe_charge_id)
+		
+		frappe.db.commit()
+		frappe.log_error(f"Payment Request {payment_request_name} fully processed", "Payment Processing Complete")
+		
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Process Payment Request Error: {payment_request_name}")
+
+
+def create_automatic_payment_entry(pr_doc, stripe_charge_id):
+	"""Crée automatiquement un Payment Entry pour un Payment Request"""
+	try:
+		# Vérifier qu'un Payment Entry n'existe pas déjà
+		existing_pe = frappe.db.exists("Payment Entry", {
+			"party": pr_doc.party,
+			"reference_no": stripe_charge_id,
+			"docstatus": ["<", 2]
+		})
+		
+		if existing_pe:
+			frappe.log_error(f"Payment Entry already exists: {existing_pe}", "Payment Entry Exists")
+			return existing_pe
+		
+		# Créer un nouveau Payment Entry
+		pe_doc = frappe.new_doc("Payment Entry")
+		pe_doc.payment_type = "Receive"
+		pe_doc.party_type = "Customer"
+		pe_doc.party = pr_doc.party
+		pe_doc.posting_date = frappe.utils.nowdate()
+		pe_doc.paid_amount = pr_doc.grand_total
+		pe_doc.received_amount = pr_doc.grand_total
+		pe_doc.target_exchange_rate = 1
+		pe_doc.source_exchange_rate = 1
+		pe_doc.reference_no = stripe_charge_id
+		pe_doc.reference_date = frappe.utils.nowdate()
+		pe_doc.company = pr_doc.company
+		pe_doc.mode_of_payment = "Stripe"
+		
+		# Configuration des comptes
+		pe_doc.paid_from = "411000 - CLIENTS DIVERS - JE"  # Compte client
+		pe_doc.paid_to = "512900 - Stripe-Stripe - JE"     # Compte Stripe
+		
+		# Ajouter la référence au document source
+		if pr_doc.reference_doctype and pr_doc.reference_name:
+			pe_doc.append("references", {
+				"reference_doctype": pr_doc.reference_doctype,
+				"reference_name": pr_doc.reference_name,
+				"allocated_amount": pr_doc.grand_total
+			})
+		
+		# Sauvegarder en draft
+		pe_doc.save(ignore_permissions=True)
+		frappe.log_error(f"Payment Entry created in draft: {pe_doc.name}", "Payment Entry Created")
+		
+		# Essayer de soumettre automatiquement
+		try:
+			pe_doc.submit()
+			frappe.log_error(f"Payment Entry submitted: {pe_doc.name}", "Payment Entry Submitted")
+		except Exception as submit_error:
+			frappe.log_error(f"Could not auto-submit Payment Entry {pe_doc.name}: {str(submit_error)}", "Payment Entry Draft Only")
+		
+		return pe_doc.name
+		
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"Create Payment Entry Error for {pr_doc.name}")
+		return None
 
 
 def handle_payment_intent_succeeded(event):
@@ -428,7 +520,7 @@ def handle_payment_intent_succeeded(event):
 		integration_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status, data
 			FROM `tabIntegration Request`
-			WHERE service_name = 'Stripe'
+			WHERE integration_request_service = 'Stripe'
 			AND status IN ('Initiated', 'Queued')
 			AND (reference_docname LIKE %s OR data LIKE %s)
 			ORDER BY creation DESC
@@ -473,7 +565,7 @@ def handle_charge_failed(event):
 		integration_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status
 			FROM `tabIntegration Request`
-			WHERE service_name = 'Stripe'
+			WHERE integration_request_service = 'Stripe'
 			AND status IN ('Initiated', 'Queued')
 			AND (reference_docname LIKE %s OR data LIKE %s)
 			ORDER BY creation DESC
@@ -509,7 +601,7 @@ def handle_payment_intent_failed(event):
 		integration_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status
 			FROM `tabIntegration Request`
-			WHERE service_name = 'Stripe'
+			WHERE integration_request_service = 'Stripe'
 			AND status IN ('Initiated', 'Queued')
 			AND (reference_docname LIKE %s OR data LIKE %s)
 			ORDER BY creation DESC
@@ -625,13 +717,27 @@ def force_update_integration_request(integration_request_name, status="Completed
 
 
 @frappe.whitelist()
+def test_payment_processing(payment_request_name, stripe_charge_id="test_charge_123"):
+	"""Teste le traitement automatique d'un Payment Request (pour debug)"""
+	try:
+		# Tester la fonction process_payment_request
+		process_payment_request(payment_request_name, stripe_charge_id, 200.45)
+		
+		return {"success": True, "message": f"Payment Request {payment_request_name} processed successfully"}
+		
+	except Exception as e:
+		frappe.log_error(frappe.get_traceback(), "Test Payment Processing Error")
+		return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist()
 def get_pending_integration_requests():
 	"""Récupère les Integration Requests en attente (pour debug)"""
 	try:
 		pending_requests = frappe.db.sql("""
 			SELECT name, reference_doctype, reference_docname, status, creation, data
 			FROM `tabIntegration Request`
-			WHERE service_name = 'Stripe'
+			WHERE integration_request_service = 'Stripe'
 			AND status IN ('Initiated', 'Queued')
 			ORDER BY creation DESC
 			LIMIT 20
