@@ -12,6 +12,8 @@
   "webhooks_secret",
   "use_sandbox",
   "header_img"
+  "use_sandbox",
+  "header_img"
  ],
  "fields": [
   {
@@ -43,6 +45,11 @@
    "fieldname": "use_sandbox",
    "fieldtype": "Check",
    "label": "Use Sandbox"
+  },
+  {
+   "fieldname": "header_img",
+   "fieldtype": "Attach Image",
+   "label": "Header Image"
   },
   {
    "fieldname": "header_img",
